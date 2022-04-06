@@ -45,7 +45,6 @@ WARNING: The login details are viewable as plaintext in qutebrowser's debug log
 (qute://log) and might be shared if you decide to submit a crash report!"""
 
 
-import argparse
 import enum
 import functools
 import os
@@ -57,40 +56,11 @@ import keyring
 import logging
 from typing import List
 
+import click
 
 logger = logging.getLogger(__name__)
 
-
 USERNAME = os.getlogin()
-
-
-argument_parser = argparse.ArgumentParser(
-    description=__doc__,
-    usage=USAGE,
-    epilog=EPILOG,
-)
-argument_parser.add_argument('url', nargs='?', default=os.getenv('QUTE_URL'))
-argument_parser.add_argument('--dmenu-invocation', '-d', default='rofi -dmenu -i -p Bitwarden',
-                             help='Invocation used to execute a dmenu-provider')
-argument_parser.add_argument('--password-prompt-invocation', '-p', default='rofi -dmenu -p "Master Password" -password -lines 0',
-                             help='Invocation used to prompt the user for their Bitwarden password')
-argument_parser.add_argument('--no-insert-mode', '-n', dest='insert_mode', action='store_false',
-                             help="Don't automatically enter insert mode")
-argument_parser.add_argument('--totp', '-t', action='store_true',
-                             help="Copy TOTP key to clipboard")
-argument_parser.add_argument('--io-encoding', '-i', default='UTF-8',
-                             help='Encoding used to communicate with subprocesses')
-argument_parser.add_argument('--merge-candidates', '-m', action='store_true',
-                             help='Merge pass candidates for fully-qualified and registered domain name')
-argument_parser.add_argument('--auto-lock', type=int, default=900,
-                             help='Automatically lock the vault after this many seconds')
-group = argument_parser.add_mutually_exclusive_group()
-group.add_argument('--username-only', '-e',
-                   action='store_true', help='Only insert username')
-group.add_argument('--password-only', '-w',
-                   action='store_true', help='Only insert password')
-group.add_argument('--totp-only', '-T',
-                   action='store_true', help='Only insert totp code')
 
 stderr = functools.partial(print, file=sys.stderr)
 
@@ -131,10 +101,9 @@ def ask_password():
     return code
 
 
-def get_session_key(auto_lock):
-    if auto_lock == 0:
+def get_session_key(auto_lock, renew: bool = False):
+    if auto_lock == 0 or renew:
         keyring.delete_password(USERNAME, "bw_session")
-        return ask_password()
 
     session = keyring.get_password(USERNAME, "bw_session")
     if not session:
@@ -143,13 +112,13 @@ def get_session_key(auto_lock):
             logger.error("Error from subprocess: %s", session.stderr.strip())
             raise Exception("Could not unlock Vault")
         session = session.stdout.strip()
-        keyring.set_password(USERNAME, "bw_session", session.decode("utf-8"))
+        if auto_lock != 0:
+            keyring.set_password(USERNAME, "bw_session", session.decode("utf-8"))
     return session
 
 
-def pass_(domain, encoding, auto_lock):
-    session_key = get_session_key(auto_lock)
-    logging.error(session_key) 
+def pass_(domain, encoding, auto_lock, renew: bool = False, second_attempt: bool = False):
+    session_key = get_session_key(auto_lock, renew)
     process = subprocess.run(
         ['/usr/local/bin/node', '/opt/homebrew/bin/bw', 'list', 'items', '--session', session_key, '--url', domain],
         stdout=subprocess.PIPE,
@@ -158,6 +127,8 @@ def pass_(domain, encoding, auto_lock):
 
     err = process.stderr.decode(encoding).strip()
     if err:
+        if "mac failed" in err and not second_attempt:
+            return pass_(domain, encoding, auto_lock, True, True)
         msg = 'Bitwarden CLI returned for {:s} - {:s}'.format(domain, err)
         stderr(msg)
 
@@ -169,8 +140,8 @@ def pass_(domain, encoding, auto_lock):
     return out
 
 
-def get_totp_code(selection_id, domain_name, encoding, auto_lock, password_prompt_invocation):
-    session_key = get_session_key(auto_lock, password_prompt_invocation)
+def get_totp_code(selection_id, domain_name, encoding, auto_lock):
+    session_key = get_session_key(auto_lock)
     process = subprocess.run(
         ['/usr/local/bin/node', '/opt/homebrew/bin/bw', 'get', 'totp', '--session', session_key, selection_id],
         stdout=subprocess.PIPE,
@@ -192,40 +163,55 @@ def get_totp_code(selection_id, domain_name, encoding, auto_lock, password_promp
 
 
 def fake_key_raw(text):
+    # remove all characters from input
+    qute_command('fake-key <Alt-Backspace>')
     for character in text:
         # Escape all characters by default, space requires special handling
         sequence = '" "' if character == ' ' else '\{}'.format(character)
         qute_command('fake-key {}'.format(sequence))
 
 
-def ask_for_choice(choices: List[str]):
+def ask_for_choice(choices: List[str], username_only: bool, password_only: bool):
     choices_str = "{" + ', '.join(f'"{w}"' for w in choices) + "}"
     default = "{" + f'"{choices[0]}"' + "}"
+    additinal_text = "[Username only]" if username_only else "[Password only]" if password_only else ""
     process = subprocess.run(
         ["/usr/bin/osascript", "-e", """\
             set thePassChoices to {choices} \n
-            set the result to choose from list thePassChoices with prompt \"Select your item to fill password:\" \
+            set the result to choose from list thePassChoices with prompt \"Select your item to fill the data: \
+                    {additinal_text}\" \
             default items {default} \n
             return result
             """.format(
                 choices=choices_str,
                 default=default,
+                additinal_text=additinal_text,
             ), 
         ],
         stdout=subprocess.PIPE,
     )
     if process.returncode > 0:
-        raise Exception('Could not get information from choses. Either code or system error')
+        raise Exception('Could not get information from choices. Either code or system error.')
     chose = process.stdout.strip()
     return chose
 
 
-def main(arguments):
-    if not arguments.url:
-        argument_parser.print_help()
+@click.command()
+@click.option("--url", type=str, default=os.getenv("QUTE_URL"))
+@click.option("--no-insert-mode", type=bool, help="Don't automatically enter insert mode")
+@click.option("--totp", type=bool, help="Copy TOTP key to clipboard")
+@click.option("--io-encoding", type=str, default="UTF-8",help="Encoding used to communicate with subprocesses")
+@click.option("--merge-candidates", type=bool, help="Merge pass candidates for fully-qualified and registered domain name")
+@click.option("--auto-lock", type=int, default=900, help="Automatically lock the vault after this many seconds")
+@click.option('--username-only', type=bool, help='Only insert username')
+@click.option('--password-only', type=bool, help='Only insert password')
+@click.option('--totp-only', type=bool, help='Only insert totp code')
+def main(url: str, no_insert_mode: bool, totp: bool, io_encoding: bool, merge_candidates: bool, auto_lock: int,
+        username_only: bool, password_only: bool, totp_only: bool, *args, **kwargs):
+    if not url:
         return ExitCodes.FAILURE
 
-    extract_result = tldextract.extract(arguments.url)
+    extract_result = tldextract.extract(url)
 
     # Try to find candidates using targets in the following order: fully-qualified domain name (includes subdomains),
     # the registered domain name and finally: the IPv4 address if that's what
@@ -240,62 +226,55 @@ def main(arguments):
         target_candidates = json.loads(
             pass_(
                 target,
-                arguments.io_encoding,
-                arguments.auto_lock,
+                io_encoding,
+                auto_lock,
             )
         )
         if not target_candidates:
             continue
 
         candidates = candidates + target_candidates
-        if not arguments.merge_candidates:
+        if not merge_candidates:
             break
     else:
         if not candidates:
-            stderr('No pass candidates for URL {!r} found!'.format(
-                arguments.url))
+            stderr('No pass candidates for URL {!r} found!'.format(url))
             return ExitCodes.NO_PASS_CANDIDATES
 
-    if len(candidates) == 1:
-        selection = candidates.pop()
-    else:
-        choices = []
-        for c in candidates:
-            if not c:
-                continue
-            name = c["name"] or "name not specified"
-            username = c["login"]["username"] or "username not specified"
-            choices.append("{:s} | {:s}".format(name, username))
-        choice = ask_for_choice(choices).decode("utf-8")
-        choice_tokens = choice.split('|')
-        choice_name = choice_tokens[0].strip()
-        choice_username = choice_tokens[1].strip()
-        selection = next((c for (i, c) in enumerate(candidates)
-                          if c['name'] == choice_name
-                          and c['login']['username'] == choice_username),
-                         None)
+    choices = []
+    for c in candidates:
+        if not c:
+            continue
+        name = c["name"] or "[name not specified]"
+        username = c["login"]["username"] or "[username not specified]"
+        choices.append("{:s} | {:s}".format(name, username))
+    choice = ask_for_choice(choices, username_only, password_only).decode("utf-8")
+    choice_tokens = choice.split('|')
+    choice_name = choice_tokens[0].strip()
+    choice_username = choice_tokens[1].strip()
+    selection = [c for c in candidates if c['name'] == choice_name and c['login']['username'] == choice_username]
 
     # Nothing was selected, simply return
     if not selection:
         return ExitCodes.SUCCESS
 
+    selection = selection[0]
     username = selection['login']['username']
     password = selection['login']['password']
     totp = selection['login']['totp']
 
-    if arguments.username_only and username:
+    if username_only and username:
         fake_key_raw(username)
-    elif arguments.password_only and password:
+    elif password_only and password:
         fake_key_raw(password)
-    elif arguments.totp_only:
+    elif totp_only:
         # No point in moving it to the clipboard in this case
         fake_key_raw(
             get_totp_code(
                 selection['id'],
                 selection['name'],
-                arguments.io_encoding,
-                arguments.auto_lock,
-                arguments.password_prompt_invocation,
+                io_encoding,
+                auto_lock,
             )
         )
     else:
@@ -307,22 +286,22 @@ def main(arguments):
             qute_command('fake-key <Tab>')
         if password:
             fake_key_raw(password)
+            qute_command('fake-key <Shift-Tab>')
 
-    if arguments.insert_mode:
+    if not no_insert_mode:
         qute_command('mode-enter insert')
 
     # If it finds a TOTP code, it copies it to the clipboard,
     # which is the same behavior as the Firefox add-on.
-    if not arguments.totp_only and totp and arguments.totp:
+    if not totp_only and totp and totp:
         # The import is done here, to make pyperclip an optional dependency
         import pyperclip
         pyperclip.copy(
             get_totp_code(
                 selection['id'],
                 selection['name'],
-                arguments.io_encoding,
-                arguments.auto_lock,
-                arguments.password_prompt_invocation,
+                io_encoding,
+                auto_lock,
             )
         )
 
@@ -330,5 +309,4 @@ def main(arguments):
 
 
 if __name__ == '__main__':
-    arguments = argument_parser.parse_args()
-    sys.exit(main(arguments))
+    sys.exit(main())
