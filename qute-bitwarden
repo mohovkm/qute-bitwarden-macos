@@ -52,6 +52,7 @@ import logging
 import os
 import subprocess
 import sys
+from html.parser import HTMLParser
 from typing import List
 
 import click
@@ -185,13 +186,16 @@ def get_totp_code(selection_id, domain_name, encoding, auto_lock):
     return out
 
 
-def fake_key_raw(text):
-    # remove all characters from input
-    qute_command("fake-key <Alt-Backspace>")
-    for character in text:
-        # Escape all characters by default, space requires special handling
-        sequence = '" "' if character == " " else "\{}".format(character)
-        qute_command("fake-key {}".format(sequence))
+def fake_key_raw(text, element_id=None):
+    if element_id:
+        qute_command("click-element id {element_id}".format(element_id=element_id))
+
+    qute_command(
+        "jseval --quiet document.getElementById('{element_id}').value = '{text}'".format(
+            element_id=element_id,
+            text=text,
+        )
+    )
 
 
 def ask_for_choice(choices: List[str], username_only: bool, password_only: bool):
@@ -228,6 +232,47 @@ def ask_for_choice(choices: List[str], username_only: bool, password_only: bool)
         )
     chose = process.stdout.strip()
     return chose
+
+
+def get_username_and_password_id():
+
+    with open(os.environ["QUTE_HTML"], "r") as f:
+        data = f.read()
+
+    inputs = []
+
+    class myParser(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if tag == "input":
+                inputs.append(attrs)
+
+    parser = myParser()
+    parser.feed(data)
+    username_id = None
+    password_id = None
+    email_id = None
+
+    for attrs in inputs:
+        if username_id and password_id:
+            break
+
+        if any(map(lambda x: x[0] == "type" and x[1] == "password", attrs)):
+            for i in attrs:
+                if i[0] == "id":
+                    password_id = i[1]
+                    continue
+        if any(map(lambda x: x[0] == "type" and x[1] == "text", attrs)):
+            for i in attrs:
+                if i[0] == "id":
+                    username_id = i[1]
+                    continue
+        if any(map(lambda x: x[0] == "type" and x[1] == "email", attrs)):
+            for i in attrs:
+                if i[0] == "id":
+                    email_id = i[1]
+                    continue
+
+    return username_id, password_id, email_id
 
 
 @click.command()
@@ -307,16 +352,22 @@ def main(
             return ExitCodes.NO_PASS_CANDIDATES
 
     choices = []
+    not_specified_name = "[name not specified]"
+    not_specified_username = "[username not specified]"
     for c in candidates:
         if not c:
             continue
-        name = c["name"] or "[name not specified]"
-        username = c["login"]["username"] or "[username not specified]"
+        name = c["name"] or not_specified_name
+        username = c["login"]["username"] or not_specified_username
         choices.append("{:s} | {:s}".format(name, username))
     choice = ask_for_choice(choices, username_only, password_only).decode("utf-8")
     choice_tokens = choice.split("|")
     choice_name = choice_tokens[0].strip()
     choice_username = choice_tokens[1].strip()
+    choice_name = choice_name if choice_name != not_specified_name else None
+    choice_username = (
+        choice_username if choice_username != not_specified_username else None
+    )
     selection = [
         c
         for c in candidates
@@ -328,14 +379,19 @@ def main(
         return ExitCodes.SUCCESS
 
     selection = selection[0]
-    username = selection["login"]["username"]
-    password = selection["login"]["password"]
+    username = selection.get("login", {}).get("username")
+    password = selection.get("login", {}).get("password")
+    email = selection.get("login", {}).get("email")
     totp = selection["login"]["totp"]
 
-    if username_only and username:
-        fake_key_raw(username)
-    elif password_only and password:
-        fake_key_raw(password)
+    username_id, password_id, email_id = get_username_and_password_id()
+
+    if username_id and username and not password_id:
+        fake_key_raw(username, username_id)
+    elif password_id and password and not username_id:
+        fake_key_raw(password, password_id)
+    elif email_id and email and not username_id:
+        fake_key_raw(email, email_id)
     elif totp_only:
         # No point in moving it to the clipboard in this case
         fake_key_raw(
@@ -350,12 +406,12 @@ def main(
         # Enter username and password using fake-key and <Tab> (which seems to work almost universally), then switch
         # back into insert-mode, so the form can be directly submitted by
         # hitting enter afterwards
-        if username:
-            fake_key_raw(username)
-            qute_command("fake-key <Tab>")
-        if password:
-            fake_key_raw(password)
-            qute_command("fake-key <Shift-Tab>")
+        if username_id and username:
+            fake_key_raw(username, username_id)
+        if email_id and email:
+            fake_key_raw(username, email_id)
+        if password_id and password:
+            fake_key_raw(password, password_id)
 
     if not no_insert_mode:
         qute_command("mode-enter insert")
